@@ -2,3 +2,5 @@ flask
 boto3
 requests
 pytz
+uhashring
+redis

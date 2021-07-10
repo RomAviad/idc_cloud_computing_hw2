@@ -28,6 +28,8 @@ class CacheAppDeployer(object):
         http_con.request("GET", "/ip")
         response = http_con.getresponse()
         self.my_ip = response.read().decode()
+        self.redis_host = None
+        self._redis_cluster_id = None
 
     @property
     def run_id(self):
@@ -40,6 +42,12 @@ class CacheAppDeployer(object):
         if self._elb_name is None:
             self._elb_name = f"{self.run_id}-elb"
         return self._elb_name
+
+    @property
+    def redis_cluster_id(self):
+        if self._redis_cluster_id is None:
+            self._redis_cluster_id = f"hw2-sync-redis-{self.run_id}"
+        return self._redis_cluster_id
 
     @property
     def key_name(self):
@@ -97,19 +105,20 @@ class CacheAppDeployer(object):
             }
             for port in [22, 5000]
         ]
-        ip_permissions.append(
-            {
-                "FromPort": 5000,
-                "IpProtocol": "tcp",
-                "IpRanges": [
-                    {
-                        "CidrIp": cidr_block,
-                        "Description": f"port 5000 access from my ip",
-                    },
-                ],
-                "ToPort": 5000,
-            }
-        )
+        for port in [5000, 6379]:
+            ip_permissions.append(
+                {
+                    "FromPort": port,
+                    "IpProtocol": "tcp",
+                    "IpRanges": [
+                        {
+                            "CidrIp": cidr_block,
+                            "Description": f"port {port} access from within security group",
+                        },
+                    ],
+                    "ToPort": port,
+                }
+            )
         auth_response = client.authorize_security_group_ingress(
             GroupName=instance_group_name,
             IpPermissions=ip_permissions,
@@ -153,7 +162,7 @@ class CacheAppDeployer(object):
         response = client.create_bucket(Bucket=bucket_name)
         return bucket_name
 
-    def create_instance(self, sg_id, key_pair_file, key_name, s3_bucket):
+    def create_instance(self, sg_id, key_pair_file, key_name, s3_bucket, redis_address):
         client = self.ec2_client
 
         response = client.run_instances(
@@ -186,6 +195,8 @@ class CacheAppDeployer(object):
                     f"export STORE_BUCKET={s3_bucket}\n",
                     f"export AWS_ACCESS_KEY_ID={session_creds.access_key}\n",
                     f"export AWS_SECRET_ACCESS_KEY={session_creds.secret_key}\n",
+                    f"export REDIS_ADDRESS={redis_address}\n",
+                    f"export NODE_IP={public_ip_address}\n",
                 ]
             )
 
@@ -196,7 +207,7 @@ class CacheAppDeployer(object):
 
         scp_command = (
             f'scp -i {key_pair_file} -o "StrictHostKeyChecking=no" -o "ConnectionAttempts=60" '
-            f"requirements.txt {store_config_file} {main_script} server/main.py ubuntu@{public_ip_address}:/home/ubuntu/"
+            f"requirements.txt {store_config_file} {main_script} server/main.py server/cache_ring_management.py ubuntu@{public_ip_address}:/home/ubuntu/"
         )
 
         os.system(scp_command)
@@ -307,15 +318,20 @@ class CacheAppDeployer(object):
         key_pair_file, key_name = self.create_key_pair()
         elb_arn, vpc_id, elb_endpoint = self.create_elb()
         security_groups = self.create_security_groups(vpc_id=vpc_id, elb_arn=elb_arn)
+
+        instances_sg_id = security_groups["instances"][1]
+
+        redis_address = self.create_redis(sg_id=instances_sg_id)
         target_group_arn = self.create_target_group_and_listeners(
             vpc_id=vpc_id, elb_arn=elb_arn
         )
         s3_bucket = self.create_s3_bucket()
         instance_id, instance_ip = self.create_instance(
-            sg_id=security_groups["instances"][1],
+            sg_id=instances_sg_id,
             key_pair_file=key_pair_file,
             key_name=key_name,
             s3_bucket=s3_bucket,
+            redis_address=redis_address,
         )
 
         self.register_instance_in_elb(
@@ -330,24 +346,63 @@ class CacheAppDeployer(object):
         )
         target_group_arn = target_group_response["TargetGroups"][0]["TargetGroupArn"]
         return target_group_arn
-    
+
     def add_instance_to_existing_deployment(self):
         key_name = self.key_name
         key_pair_file = f"{key_name}.pem"
         security_groups = self.get_security_groups()
         bucket_name = self.bucket_name
+        redis_address = self.get_redis_address()
 
         instance_id, instance_ip = self.create_instance(
             sg_id=security_groups["instances"][1],
             key_pair_file=key_pair_file,
             key_name=key_name,
             s3_bucket=bucket_name,
+            redis_address=redis_address,
         )
 
         target_group_arn = self.get_target_group()
         self.register_instance_in_elb(
             instance_id=instance_id, target_group_arn=target_group_arn
         )
+
+    def create_redis(self, sg_id):
+        client = self.session.client("elasticache")
+        cluster_id = self.redis_cluster_id
+        response = client.create_cache_cluster(
+            CacheClusterId=cluster_id,
+            Engine="redis",
+            NumCacheNodes=1,
+            CacheNodeType="cache.t3.micro",
+            SecurityGroupIds=[sg_id],
+        )
+
+        waiter = client.get_waiter("cache_cluster_available")
+        waiter.wait(CacheClusterId=cluster_id)
+
+        describe_response = client.describe_cache_clusters(
+            CacheClusterId=cluster_id, ShowCacheNodeInfo=True
+        )
+        redis_address = describe_response["CacheClusters"][0]["CacheNodes"][0][
+            "Endpoint"
+        ]["Address"]
+        self.redis_host = redis_address
+        print(f"Created redis cluster with ID {cluster_id}; address: {redis_address}")
+
+        return redis_address
+
+    def get_redis_address(self):
+        client = self.session.client("elasticache")
+        describe_response = client.describe_cache_clusters(
+            CacheClusterId=self.redis_cluster_id, ShowCacheNodeInfo=True
+        )
+        redis_address = describe_response["CacheClusters"][0]["CacheNodes"][0][
+            "Endpoint"
+        ]["Address"]
+        self.redis_host = redis_address
+
+        return redis_address
 
 
 if __name__ == "__main__":
@@ -384,7 +439,8 @@ if __name__ == "__main__":
                     f"ENDPOINT: http://{endpoint}",
                     f"RUN_ID: {deployer.run_id}",
                     f"S3 BUCKET: {deployer.bucket_name}",
-                    f"PEM FILE: {deployer.key_name}.pem"
+                    f"PEM FILE: {deployer.key_name}.pem",
+                    f"REDIS HOST: {deployer.redis_host}",
                 ]
             )
         )

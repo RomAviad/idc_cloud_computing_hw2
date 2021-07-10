@@ -27,10 +27,11 @@ You do not have to worry about consistency or concurrency, a read may get an old
 * Python as the language of choice
 * `Flask` as a basis for HTTP serving
 * Deployment script is in python, using `boto3`
-* Cache entries are stored as objects on AWS S3 for several reasons:
-    * Data-loss resistant upon instance crash
-    * No need to sync memory in between instances
-    * Allows us to use very minimalistic instance resources allocations
+* Cache entries are held in-memory, sharded across the live nodes with redundancy.
+* Cache entries are persisted as objects on AWS S3
+  * Data-loss resistant, even in case all of the nodes that hold a specific key in-memory crash.
+* Redis (on ElastiCache) is used by this project's cache nodes to report heartbeat
+  * Easy to keep track on how many nodes we have live and (re)distribute cached data
     
 ## Run instructions
 ### First-run dependencies:
@@ -53,7 +54,8 @@ APP DEPLOYMENT DONE!
 ENDPOINT: <your load-balancer endpoint>
 RUN_ID: <generated run_id (to be used for adding more instances later on>
 S3 BUCKET: <deployment target S3 bucket>
-PEM FILE: <name of the pem file created with the key-pair of the deployment>"
+PEM FILE: <name of the pem file created with the key-pair of the deployment>
+REDIS HOST: <redis endpoint (used for cache node heartbeat checking across nodes)>
 ```
 
 ### Adding an instance to an existing deployment
